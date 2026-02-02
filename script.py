@@ -10,12 +10,13 @@ import re
 import random
 from pathlib import Path
 from playwright.async_api import async_playwright
+import aiohttp
  
 BASE_URL = "https://www.justice.gov/epstein/doj-disclosures/data-set-9-files"
 OUTPUT_DIR = Path(r"D:\Epstein Files\Dataset9")
 INDEX_FILE = OUTPUT_DIR / "dataset9_index.json"
 STATE_FILE = OUTPUT_DIR / "dataset9_state.json"
-BATCH_SIZE = 100
+BATCH_SIZE = None  # None means no per-batch limit; scrape/download everything found
 HEADLESS = False
 SLOW_MO_MS = 50
 SCRAPE_RETRIES = 5
@@ -28,6 +29,7 @@ EXTRA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
+DOWNLOAD_CHUNK_SIZE = 1_048_576  # 1MB chunks to avoid large memory use
 
 
 def _load_json(path, default):
@@ -57,6 +59,16 @@ def _load_state():
 
 def _save_state(state):
     _save_json(STATE_FILE, state)
+
+
+def _existing_file_names():
+    if not OUTPUT_DIR.exists():
+        return set()
+    return {p.name for p in OUTPUT_DIR.glob("*") if p.is_file()}
+
+
+def _cookie_dict_from_list(cookie_list):
+    return {c["name"]: c["value"] for c in cookie_list}
  
 def _age_cookies():
     return [
@@ -193,6 +205,7 @@ async def _get_max_page(page):
 async def _scrape_pages_for_batch(batch_size, all_files, file_set, state):
     """Scrape pages until we collect batch_size new files or reach the end."""
     new_files = []
+    existing_files = _existing_file_names()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS)
@@ -226,7 +239,7 @@ async def _scrape_pages_for_batch(batch_size, all_files, file_set, state):
             current_page += 1
 
         # Main loop: click Next for each subsequent page
-        while len(new_files) < batch_size:
+        while batch_size is None or len(new_files) < batch_size:
             print(f"Scraping page {current_page}...")
 
             if await _page_is_access_denied(page):
@@ -242,6 +255,7 @@ async def _scrape_pages_for_batch(batch_size, all_files, file_set, state):
                 print(f"No files found on page {current_page}, stopping.")
                 break
 
+            page_new_files = []
             for href in links:
                 filename = href.split("/")[-1]
                 if filename not in file_set:
@@ -249,14 +263,23 @@ async def _scrape_pages_for_batch(batch_size, all_files, file_set, state):
                     record = {
                         "filename": filename,
                         "url": f"https://www.justice.gov{href}" if href.startswith("/") else href,
-                        "downloaded": False
+                        "downloaded": filename in existing_files
                     }
                     all_files.append(record)
                     new_files.append(record)
-                    if len(new_files) >= batch_size:
+                    page_new_files.append(record)
+                    if batch_size is not None and len(new_files) >= batch_size:
                         break
 
             print(f"  Found {len(links)} links, total unique files: {len(all_files)}")
+
+            if page_new_files:
+                print(f"  Downloading {len(page_new_files)} new files from page {current_page}...")
+                downloaded, skipped, failed = await _download_batch(page_new_files, all_files)
+                _save_index(all_files)
+                if failed > 0:
+                    print("  Some downloads failed on this page; will resume later.")
+
             current_page += 1
             state["next_page"] = current_page
             _save_state(state)
@@ -284,21 +307,28 @@ async def _download_batch(batch, all_files):
         return 0, 0, 0
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    existing_files = _existing_file_names()
+
+    # Create an HTTP session for streaming large files without loading into memory
+    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_MS / 1000 + 60)
+    headers = {"User-Agent": USER_AGENT, **EXTRA_HEADERS}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS)
         context = await browser.new_context(
-            accept_downloads=True,
             user_agent=USER_AGENT,
             locale="en-US",
             timezone_id="America/New_York",
             extra_http_headers=EXTRA_HEADERS
         )
-
         await _add_age_cookies(context)
-
         page = await context.new_page()
         await _ensure_age_verified(page)
+        context_cookies = await context.cookies()
+
+    cookie_jar = aiohttp.CookieJar()
+    cookie_jar.update_cookies(_cookie_dict_from_list(context_cookies))
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout, cookie_jar=cookie_jar) as session:
 
         downloaded = 0
         skipped = 0
@@ -309,7 +339,7 @@ async def _download_batch(batch, all_files):
             url = file_info["url"]
             output_path = OUTPUT_DIR / filename
 
-            if output_path.exists():
+            if output_path.exists() or filename in existing_files:
                 file_info["downloaded"] = True
                 skipped += 1
                 _save_index(all_files)
@@ -320,16 +350,18 @@ async def _download_batch(batch, all_files):
             success = False
             for attempt in range(1, DOWNLOAD_RETRIES + 1):
                 try:
-                    resp = await context.request.get(url, timeout=DOWNLOAD_TIMEOUT_MS)
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    content_type = resp.headers.get("content-type", "").lower()
-                    if "text/html" in content_type:
-                        await _ensure_age_verified(page)
-                        raise RuntimeError("Age gate or HTML response")
-                    data = await resp.body()
-                    with open(output_path, "wb") as f:
-                        f.write(data)
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        content_type = resp.headers.get("content-type", "").lower()
+                        if "text/html" in content_type:
+                            # Likely age gate or error page
+                            text_sample = await resp.text(errors="ignore")
+                            raise RuntimeError(f"HTML response: {content_type}")
+                        with open(output_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                                if chunk:
+                                    f.write(chunk)
                     file_info["downloaded"] = True
                     downloaded += 1
                     success = True
@@ -343,8 +375,6 @@ async def _download_batch(batch, all_files):
 
             _save_index(all_files)
             await asyncio.sleep(0.3)
-
-        await browser.close()
 
     return downloaded, skipped, failed
 
@@ -372,7 +402,7 @@ async def auto_scrape_and_download(batch_size=BATCH_SIZE):
     while True:
         pending = [f for f in all_files if not f.get("downloaded")]
         if pending:
-            batch = pending[:batch_size]
+            batch = pending if batch_size is None else pending[:batch_size]
             print(f"Downloading existing pending batch: {len(batch)} files")
             downloaded, skipped, failed = await _download_batch(batch, all_files)
             _save_index(all_files)
@@ -399,25 +429,36 @@ async def auto_scrape_and_download(batch_size=BATCH_SIZE):
 async def main():
     import sys
 
+    # Optional args:
+    #   auto [batch_size]
+    #   download [start_index]
     if len(sys.argv) < 2:
-        print("No command provided, running auto mode.")
-        await auto_scrape_and_download()
-        return
-
-    cmd = sys.argv[1].lower()
+        cmd = "auto"
+        args = []
+    else:
+        cmd = sys.argv[1].lower()
+        args = sys.argv[2:]
 
     if cmd == "auto":
-        await auto_scrape_and_download()
+        if len(args) > 0 and args[0].lower() not in ("none", "all"):
+            batch_size = int(args[0])
+        else:
+            batch_size = None
+        await auto_scrape_and_download(batch_size)
     elif cmd == "scrape":
         print("Scrape-only mode is deprecated in this script. Use auto mode.")
-        await auto_scrape_and_download()
+        if len(args) > 0 and args[0].lower() not in ("none", "all"):
+            batch_size = int(args[0])
+        else:
+            batch_size = None
+        await auto_scrape_and_download(batch_size)
     elif cmd == "download":
-        start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+        start = int(args[0]) if len(args) > 0 else 0
         await download_files(start)
     else:
         print("Usage:")
-        print("  python script.py auto            - Scrape 100 files, download them, repeat")
-        print("  python script.py download 0      - Download from index starting at file #0")
+        print("  python script.py auto [batch_size|all]   - Scrape/download in batches (default: all)")
+        print("  python script.py download [start]        - Download from index starting at file #start")
  
  
 if __name__ == '__main__':
