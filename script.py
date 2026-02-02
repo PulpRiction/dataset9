@@ -351,6 +351,13 @@ async def _download_batch(batch, all_files):
             for attempt in range(1, DOWNLOAD_RETRIES + 1):
                 try:
                     async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status == 404:
+                            print("  HTTP 404: skipping (marked missing)")
+                            file_info["downloaded"] = True
+                            file_info["missing"] = True
+                            skipped += 1
+                            success = True
+                            break
                         if resp.status != 200:
                             raise RuntimeError(f"HTTP {resp.status}")
                         content_type = resp.headers.get("content-type", "").lower()
